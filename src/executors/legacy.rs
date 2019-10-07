@@ -1,20 +1,27 @@
-use failure::Error;
 use mio::*;
+use failure::Error;
 use slab::Slab;
 use std::borrow::Borrow;
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::future::Future;
 use std::io::{self, Read, Write};
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::ptr::NonNull;
 use std::rc::Rc;
-use std::task::{self, LocalWaker, UnsafeWake, Waker};
+use std::task::{self, RawWaker, RawWakerVTable, Waker, Context};
 
 const MAX_RESOURCE_NUM: usize = 1 << 31;
 const MAIN_TASK_TOKEN: Token = Token(MAX_RESOURCE_NUM);
 const EVENT_CAP: usize = 1024;
-const POLL_TIME_OUT_MILL: u64 = 100;
+const _POLL_TIME_OUT_MILL: u64 = 100;
+
+static RAW_WAKER_V_TABLE: RawWakerVTable = RawWakerVTable::new(
+    v_clone,
+    v_wake,
+    v_wake_by_ref,
+    v_drop,
+);
 
 const fn get_source_token(index: usize) -> Token {
     Token(index * 2)
@@ -48,7 +55,7 @@ const fn is_task(token: Token) -> bool {
     token.0 % 2 == 1
 }
 
-type PinFuture<T> = Pin<Box<dyn Future<Output = T>>>;
+type PinFuture<T> = Pin<Box<dyn Future<Output=T>>>;
 
 struct Executor {
     poll: Poll,
@@ -63,7 +70,7 @@ struct InnerWaker {
 }
 
 struct Source {
-    task_waker: LocalWaker,
+    task_waker: Waker,
     evented: Box<dyn Evented>,
 }
 
@@ -98,23 +105,32 @@ pub struct StreamWriteState<'a> {
     data: Vec<u8>,
 }
 
-unsafe impl UnsafeWake for InnerWaker {
-    unsafe fn clone_raw(&self) -> Waker {
-        Waker::new(NonNull::from(self))
-    }
-
-    unsafe fn drop_raw(&self) {}
-
-    unsafe fn wake(&self) {
-        self.awake_readiness
-            .set_readiness(Ready::readable())
-            .unwrap();
-    }
+unsafe fn v_clone(waker: *const ()) -> RawWaker {
+    RawWaker::new(waker, &RAW_WAKER_V_TABLE)
 }
 
+unsafe fn v_wake(waker: *const ()) {
+    let waker = waker as *const InnerWaker;
+    (*waker).awake_readiness.set_readiness(Ready::readable()).unwrap();
+}
+
+unsafe fn v_wake_by_ref(waker: *const ()) {
+    let waker = waker as *const InnerWaker;
+    (*waker).awake_readiness.set_readiness(Ready::readable()).unwrap();
+}
+
+unsafe fn v_drop(_waker: *const ()) {}
+
 impl InnerWaker {
-    fn gen_local_waker(&self) -> LocalWaker {
-        unsafe { LocalWaker::new(NonNull::from(self)) }
+    fn gen_raw_waker(&self) -> RawWaker {
+        RawWaker::new(NonNull::from(self).as_ptr() as *const (),
+                      &RAW_WAKER_V_TABLE)
+    }
+
+    fn gen_waker(&self) -> Waker {
+        unsafe {
+            Waker::from_raw(self.gen_raw_waker())
+        }
     }
 }
 
@@ -139,26 +155,27 @@ impl Executor {
         })
     }
 
-    fn main_waker(&self) -> LocalWaker {
-        unsafe { LocalWaker::new(NonNull::from(&self.main_waker)) }
+    fn main_waker(&self) -> Waker {
+        unsafe {
+            Waker::from_raw(RawWaker::new(
+                NonNull::from(&self.main_waker).as_ptr() as *const (),
+                &RAW_WAKER_V_TABLE,
+            ))
+        }
     }
-}
 
-thread_local! {
-    static EXECUTOR: Executor = Executor::new().expect("initializing executor failed!")
-}
-
-pub fn block_on<R, F>(main_task: F) -> Result<R, Error>
-    where
-        R: Sized,
-        F: Future<Output = R>,
-{
-    EXECUTOR.with(move |executor: &Executor| -> Result<R, Error> {
+    pub fn block_on<R, F>(&self, main_task: F) -> Result<R, Error>
+        where
+            R: Sized,
+            F: Future<Output=R>,
+    {
+        let executor = self;
         let mut pinned_task = Box::pin(main_task);
         let mut events = Events::with_capacity(EVENT_CAP);
         let main_waker = executor.main_waker();
         debug!("main_waker addr: {:p}", &main_waker);
-        match pinned_task.as_mut().poll(&main_waker) {
+        let mut context = Context::from_waker(&main_waker);
+        match pinned_task.as_mut().poll(&mut context) {
             task::Poll::Ready(result) => {
                 debug!("main task complete");
                 return Ok(result);
@@ -174,7 +191,8 @@ pub fn block_on<R, F>(main_task: F) -> Result<R, Error>
                         match event.token() {
                             MAIN_TASK_TOKEN => {
                                 debug!("receive a main task event");
-                                match pinned_task.as_mut().poll(&main_waker) {
+                                let mut context = Context::from_waker(&main_waker);
+                                match pinned_task.as_mut().poll(&mut context) {
                                     task::Poll::Ready(result) => {
                                         return Ok(result);
                                     }
@@ -190,7 +208,7 @@ pub fn block_on<R, F>(main_task: F) -> Result<R, Error>
                                 debug!("source: Index({})", index);
                                 let source = &executor.sources.borrow()[index];
                                 debug!("source addr: {:p}", source);
-                                source.task_waker.wake();
+                                source.task_waker.clone().wake();
                             }
 
                             token if is_task(token) => {
@@ -198,7 +216,9 @@ pub fn block_on<R, F>(main_task: F) -> Result<R, Error>
                                 let index = unsafe { index_from_task_token(token) };
                                 let mut tasks = executor.tasks.borrow_mut();
                                 let task = &mut tasks[index];
-                                match task.inner_task.as_mut().poll(&task.waker.gen_local_waker()) {
+                                let tmp_waker = task.waker.gen_waker();
+                                let mut context = Context::from_waker(&tmp_waker);
+                                match task.inner_task.as_mut().poll(&mut context) {
                                     task::Poll::Ready(result) => {
                                         debug!("task({:?}) complete", token);
                                         executor.poll.deregister(&task.waker.awake_registration)?;
@@ -217,11 +237,13 @@ pub fn block_on<R, F>(main_task: F) -> Result<R, Error>
                 }
             }
         }
-    })
-}
+    }
 
-pub fn spawn<F: Future<Output = Result<(), Error>> + 'static>(task: F) -> Result<(), Error> {
-    EXECUTOR.with(move |executor: &Executor| {
+
+    pub fn spawn<F>(&self, task: F) -> Result<(), Error>
+        where F: Future<Output=Result<(), Error>> + 'static
+    {
+        let executor = self;
         let (awake_registration, awake_readiness) = Registration::new2();
         let index = executor.tasks.borrow_mut().insert(Task {
             inner_task: Box::pin(task),
@@ -234,7 +256,9 @@ pub fn spawn<F: Future<Output = Result<(), Error>> + 'static>(task: F) -> Result
         let mut tasks = executor.tasks.borrow_mut();
         let task = &mut tasks[index];
         debug!("task({:?}) spawn", token);
-        match task.inner_task.as_mut().poll(&task.waker.gen_local_waker()) {
+        let tmp_waker = task.waker.gen_waker();
+        let mut context = Context::from_waker(&tmp_waker);
+        match task.inner_task.as_mut().poll(&mut context) {
             task::Poll::Ready(_) => {
                 debug!("task({:?}) complete when spawn", token);
                 tasks.remove(index);
@@ -250,12 +274,32 @@ pub fn spawn<F: Future<Output = Result<(), Error>> + 'static>(task: F) -> Result
             }
         };
         Ok(())
+    }
+}
+
+thread_local! {
+    static EXECUTOR: Executor = Executor::new().expect("initializing executor failed!")
+}
+
+pub fn block_on<R, F>(main_task: F) -> Result<R, Error>
+    where
+        R: Sized,
+        F: Future<Output=R>,
+{
+    EXECUTOR.with(move |executor: &Executor| -> Result<R, Error> {
+        executor.block_on(main_task)
+    })
+}
+
+pub fn spawn<F: Future<Output=Result<(), Error>> + 'static>(task: F) -> Result<(), Error> {
+    EXECUTOR.with(move |executor: &Executor| {
+        executor.spawn(task)
     })
 }
 
 pub fn register_source<T: Evented + 'static>(
     evented: T,
-    task_waker: LocalWaker,
+    task_waker: Waker,
     interest: Ready,
 ) -> Result<Token, Error> {
     EXECUTOR.with(move |executor: &Executor| {
@@ -368,7 +412,7 @@ impl TcpListener {
 
     fn poll_accept(
         &mut self,
-        lw: &LocalWaker,
+        lw: &Waker,
     ) -> task::Poll<Result<(TcpStream, SocketAddr), Error>> {
         debug!("waker addr: {:p}", lw);
         if let None = self.accept_source_token {
@@ -443,8 +487,16 @@ impl TcpStream {
     }
 }
 
+impl Drop for TcpStream {
+    fn drop(&mut self) {
+        if let Some(token) = self.source_token {
+            unsafe { drop_source(token).unwrap() };
+        }
+    }
+}
+
 impl TcpStream {
-    fn read_poll(&mut self, lw: &LocalWaker) -> task::Poll<Result<Vec<u8>, Error>> {
+    fn read_poll(&mut self, lw: &Waker) -> task::Poll<Result<Vec<u8>, Error>> {
         match self.source_token {
             None => {
                 self.readiness = Ready::readable();
@@ -481,7 +533,7 @@ impl TcpStream {
         }
     }
 
-    fn write_poll(&mut self, data: &[u8], lw: &LocalWaker) -> task::Poll<Result<usize, Error>> {
+    fn write_poll(&mut self, data: &[u8], lw: &Waker) -> task::Poll<Result<usize, Error>> {
         match self.source_token {
             None => {
                 self.readiness = Ready::writable();
@@ -514,22 +566,22 @@ impl TcpStream {
 
 impl<'a> Future for TcpAcceptState<'a> {
     type Output = Result<(TcpStream, SocketAddr), Error>;
-    fn poll(mut self: Pin<&mut Self>, lw: &LocalWaker) -> task::Poll<<Self as Future>::Output> {
-        self.listener.poll_accept(lw)
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context) -> task::Poll<<Self as Future>::Output> {
+        self.listener.poll_accept(cx.waker())
     }
 }
 
 impl<'a> Future for StreamReadState<'a> {
     type Output = Result<Vec<u8>, Error>;
-    fn poll(mut self: Pin<&mut Self>, lw: &LocalWaker) -> task::Poll<<Self as Future>::Output> {
-        self.stream.read_poll(lw)
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context) -> task::Poll<<Self as Future>::Output> {
+        self.stream.read_poll(cx.waker())
     }
 }
 
 impl<'a> Future for StreamWriteState<'a> {
     type Output = Result<usize, Error>;
-    fn poll(mut self: Pin<&mut Self>, lw: &LocalWaker) -> task::Poll<<Self as Future>::Output> {
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context) -> task::Poll<<Self as Future>::Output> {
         let data = self.data.clone();
-        self.stream.write_poll(data.as_slice(), lw)
+        self.stream.write_poll(data.as_slice(), cx.waker())
     }
 }
